@@ -15,7 +15,8 @@ extern "C" {
 
 // User config          ------------------------------------------
 #define UWB_INDEX 2
-#define TAG
+// UWB role selection: 1 = Anchor, 0 = Tag
+#define UWB_ROLE_ANCHOR 1
 #define UWB_TAG_COUNT 64
 #define LED 42
 
@@ -33,6 +34,7 @@ extern "C" {
 
 #define DW1000_RST    4
 #define DW1000_IRQ    9
+#define UWB_EN        8
 // WiFi credentials (will be stored in flash memory)
 extern String ssid;               // Your WiFi network SSID
 extern String password;         // Your WiFi network password      

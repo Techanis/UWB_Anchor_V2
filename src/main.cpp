@@ -53,11 +53,21 @@ void loop() {
   loopDW1000();
 
   digitalWrite(LED, HIGH);
-  SERIAL_LOG.println("Lazo de control ejecutándose...");
   //Esperamos un segundo
   delay(1000);
   //Apagamos el led
   digitalWrite(LED, LOW);
+  if (digitalRead(DW1000_EXTON) == LOW) {
+    SERIAL_LOG.println("DW1000 en modo de bajo consumo EXTON");
+  } else {
+    SERIAL_LOG.println("DW1000 activo EXTON");
+  }
+
+  if (digitalRead(DW1000_RST) == LOW) {
+    SERIAL_LOG.println("DW1000 en modo de bajo consumo RST");
+  } else {
+    SERIAL_LOG.println("DW1000 activo RST");
+  }
   SERIAL_LOG.print("Medición de batería: ");
   SERIAL_LOG.println(readBatteryADC());
   SERIAL_LOG.println(isUSBConnected() ? "Fuente USB conectada" : "Fuente USB no conectada");
