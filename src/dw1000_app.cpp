@@ -109,7 +109,6 @@ void setupDW1000() {
 
 void loopDW1000() {
     DW1000Ranging.loop();
-    SERIAL_LOG.println("DW1000 loop ejecutado.");
     if (g_newRangeReady) {
         g_newRangeReady = false;
         Serial.print("[DW1000] Distancia a 0x");
