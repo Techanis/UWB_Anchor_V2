@@ -52,26 +52,26 @@ void setup() {
 void loop() {
   loopDW1000();
 
-  digitalWrite(LED, HIGH);
-  //Esperamos un segundo
-  delay(1000);
-  //Apagamos el led
-  digitalWrite(LED, LOW);
-  if (digitalRead(DW1000_EXTON) == LOW) {
-    SERIAL_LOG.println("DW1000 en modo de bajo consumo EXTON");
-  } else {
-    SERIAL_LOG.println("DW1000 activo EXTON");
+  static unsigned long lastDiagnostic = 0;
+  static bool ledState = false;
+  if (millis() - lastDiagnostic >= 2000) {
+    lastDiagnostic = millis();
+    ledState = !ledState;
+    digitalWrite(LED, ledState ? HIGH : LOW);
+    if (digitalRead(DW1000_EXTON) == LOW) {
+      SERIAL_LOG.println("DW1000 en modo de bajo consumo EXTON");
+    } else {
+      SERIAL_LOG.println("DW1000 activo EXTON");
+    }
+    if (digitalRead(DW1000_RST) == LOW) {
+      SERIAL_LOG.println("DW1000 en modo de bajo consumo RST");
+    } else {
+      SERIAL_LOG.println("DW1000 activo RST");
+    }
+    SERIAL_LOG.print("Medición de batería: ");
+    SERIAL_LOG.println(readBatteryADC());
+    SERIAL_LOG.println(isUSBConnected() ? "Fuente USB conectada" : "Fuente USB no conectada");
   }
-
-  if (digitalRead(DW1000_RST) == LOW) {
-    SERIAL_LOG.println("DW1000 en modo de bajo consumo RST");
-  } else {
-    SERIAL_LOG.println("DW1000 activo RST");
-  }
-  SERIAL_LOG.print("Medición de batería: ");
-  SERIAL_LOG.println(readBatteryADC());
-  SERIAL_LOG.println(isUSBConnected() ? "Fuente USB conectada" : "Fuente USB no conectada");
-  delay(1000);
 }
 
 // put function definitions here:
