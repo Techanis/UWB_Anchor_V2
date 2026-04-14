@@ -36,6 +36,14 @@
 #include "DW1000Constants.h"
 #include "DW1000Time.h"
 
+#if defined(ESP8266) || defined(ARDUINO_ARCH_ESP32)
+#define DW1000_ISR_ATTR IRAM_ATTR
+#else
+#define DW1000_ISR_ATTR
+#endif
+
+extern SPIClass dw1000SPI;
+
 class DW1000Class {
 public:
 	/* ##### Init ################################################################ */
@@ -68,8 +76,10 @@ public:
 	Arduino.
 	*/
 	static void reselect(uint8_t ss);
-	
-	/** 
+
+    void begin(uint8_t irq, uint8_t rst, uint8_t sck, uint8_t miso, uint8_t mosi, uint8_t ss);
+
+    /** 
 	Tells the driver library that no communication to a DW1000 will be required anymore.
 	This basically just frees SPI and the previously used pins.
 	*/
@@ -267,6 +277,7 @@ public:
 	static void interruptOnReceiveTimeout(boolean val);
 	static void interruptOnReceiveTimestampAvailable(boolean val);
 	static void interruptOnAutomaticAcknowledgeTrigger(boolean val);
+	static void processInterrupt();
 
 	/* Antenna delay calibration */
 	static void setAntennaDelay(const uint16_t value);
@@ -421,6 +432,10 @@ public:
 	static uint8_t _ss;
 	static uint8_t _rst;
 	static uint8_t _irq;
+	/* chip sck, miso and mosi pins. */
+	static uint8_t _sck;
+	static uint8_t _miso;
+	static uint8_t _mosi;
 	
 	/* callbacks. */
 	static void (* _handleError)(void);
@@ -429,6 +444,7 @@ public:
 	static void (* _handleReceiveFailed)(void);
 	static void (* _handleReceiveTimeout)(void);
 	static void (* _handleReceiveTimestampAvailable)(void);
+	static volatile boolean _interruptPending;
 	
 	/* register caches. */
 	static byte _syscfg[LEN_SYS_CFG];
@@ -468,7 +484,7 @@ public:
 	static boolean _debounceClockEnabled;
 
 	/* Arduino interrupt handler */
-	static void handleInterrupt();
+	static void DW1000_ISR_ATTR handleInterrupt();
 	
 	/* Allow MAC frame filtering . */
 	// TODO auto-acknowledge

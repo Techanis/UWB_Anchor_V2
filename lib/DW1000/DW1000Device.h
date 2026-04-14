@@ -22,7 +22,13 @@
  */
 
 
-#define INACTIVITY_TIME 1000
+#ifndef INACTIVITY_TIME
+#ifdef UWB_DEVICE_INACTIVITY_TIME_MS
+#define INACTIVITY_TIME UWB_DEVICE_INACTIVITY_TIME_MS
+#else
+#define INACTIVITY_TIME 4000
+#endif
+#endif
 
 #ifndef _DW1000Device_H_INCLUDED
 #define _DW1000Device_H_INCLUDED
@@ -94,14 +100,14 @@ private:
 	//device ID
 	byte         _ownAddress[8];
 	byte         _shortAddress[2];
-	int32_t      _activity;
+	uint32_t      _activity;
 	uint16_t     _replyDelayTimeUS;
 	int8_t       _index; // not used
 	
-	int16_t _range;
-	int16_t _RXPower;
-	int16_t _FPPower;
-	int16_t _quality;
+	float _range;
+	float _RXPower;
+	float _FPPower;
+	float _quality;
 	
 	void randomShortAddress();
 	

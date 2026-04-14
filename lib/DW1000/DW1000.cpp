@@ -26,6 +26,9 @@ DW1000Class DW1000;
  * #### Static member variables ##############################################
  * ######################################################################### */
 // pins
+uint8_t DW1000Class::_sck;
+uint8_t DW1000Class::_mosi;
+uint8_t DW1000Class::_miso;
 uint8_t DW1000Class::_ss;
 uint8_t DW1000Class::_rst;
 uint8_t DW1000Class::_irq;
@@ -38,6 +41,7 @@ void (* DW1000Class::_handleReceived)(void)                  = 0;
 void (* DW1000Class::_handleReceiveFailed)(void)             = 0;
 void (* DW1000Class::_handleReceiveTimeout)(void)            = 0;
 void (* DW1000Class::_handleReceiveTimestampAvailable)(void) = 0;
+volatile boolean DW1000Class::_interruptPending              = false;
 
 // registers
 byte       DW1000Class::_syscfg[LEN_SYS_CFG];
@@ -99,11 +103,14 @@ const byte DW1000Class::BIAS_900_16[] = {137, 122, 105, 88, 69, 47, 25, 0, 21, 4
 const byte DW1000Class::BIAS_900_64[] = {147, 133, 117, 99, 75, 50, 29, 0, 24, 45, 63, 76, 87, 98, 116, 122, 132, 142};
 */
 // SPI settings
+SPIClass dw1000SPI(FSPI);
 #ifdef ESP8266
 	// default ESP8266 frequency is 80 Mhz, thus divide by 4 is 20 MHz
 	const SPISettings DW1000Class::_fastSPI = SPISettings(20000000L, MSBFIRST, SPI_MODE0);
 #else
-	const SPISettings DW1000Class::_fastSPI = SPISettings(16000000L, MSBFIRST, SPI_MODE0);
+	// const SPISettings DW1000Class::_fastSPI = SPISettings(10000000L, MSBFIRST, SPI_MODE0);
+	const SPISettings DW1000Class::_fastSPI = SPISettings(20000000L, MSBFIRST, SPI_MODE0);
+
 #endif
 const SPISettings DW1000Class::_slowSPI = SPISettings(2000000L, MSBFIRST, SPI_MODE0);
 const SPISettings* DW1000Class::_currentSPI = &_fastSPI;
@@ -113,7 +120,7 @@ const SPISettings* DW1000Class::_currentSPI = &_fastSPI;
  * ######################################################################### */
 
 void DW1000Class::end() {
-	SPI.end();
+	dw1000SPI.end();
 }
 
 void DW1000Class::select(uint8_t ss) {
@@ -121,13 +128,14 @@ void DW1000Class::select(uint8_t ss) {
 	// try locking clock at PLL speed (should be done already,
 	// but just to be sure)
 	enableClock(AUTO_CLOCK);
-	delay(5);
+	vTaskDelay(5 / portTICK_PERIOD_MS); // 5ms
 	// reset chip (either soft or hard)
 	if(_rst != 0xff) {
 		// dw1000 data sheet v2.08 §5.6.1 page 20, the RSTn pin should not be driven high but left floating.
-		pinMode(_rst, INPUT);
+		pinMode(_rst, OUTPUT_OPEN_DRAIN);
 	}
 	reset();
+	vTaskDelay(50 / portTICK_PERIOD_MS); // 50ms
 	// default network and node id
 	writeValueToBytes(_networkAndAddress, 0xFF, LEN_PANADR);
 	writeNetworkIdAndDeviceAddress();
@@ -135,24 +143,31 @@ void DW1000Class::select(uint8_t ss) {
 	memset(_syscfg, 0, LEN_SYS_CFG);
 	setDoubleBuffering(false);
 	setInterruptPolarity(true);
+	_syscfg[0] = 0; 
+	_syscfg[1] =  0x16; 
 	writeSystemConfigurationRegister();
 	// default interrupt mask, i.e. no interrupts
 	clearInterrupts();
 	writeSystemEventMaskRegister();
 	// load LDE micro-code
 	enableClock(XTI_CLOCK);
-	delay(5);
+	vTaskDelay(5 / portTICK_PERIOD_MS); // 5ms
 	manageLDE();
-	delay(5);
+	vTaskDelay(5 / portTICK_PERIOD_MS); // 5ms
 	enableClock(AUTO_CLOCK);
-	delay(5);
+	vTaskDelay(5 / portTICK_PERIOD_MS); // 5ms
 	
 	// read the temp and vbat readings from OTP that were recorded during production test
-	// see 6.3.1 OTP memory map
+	// see 6.3.1 OTP memory map 
 	byte buf_otp[4];
 	readBytesOTP(0x008, buf_otp); // the stored 3.3 V reading
+	Serial.print("[DW1000] OTP vbat 3.3V reading: ");
+	Serial.println(buf_otp[0]);
 	_vmeas3v3 = buf_otp[0];
 	readBytesOTP(0x009, buf_otp); // the stored 23C reading
+	Serial.print("[DW1000] OTP temperature 23C reading: ");
+	Serial.println(buf_otp[0]);
+
 	_tmeas23C = buf_otp[0];
 }
 
@@ -162,24 +177,31 @@ void DW1000Class::reselect(uint8_t ss) {
 	digitalWrite(_ss, HIGH);
 }
 
-void DW1000Class::begin(uint8_t irq, uint8_t rst) {
+void DW1000Class::begin(uint8_t irq, uint8_t rst, uint8_t sck, uint8_t miso, uint8_t mosi, uint8_t ss ) {
 	// generous initial init/wake-up-idle delay
-	delay(5);
+	vTaskDelay(5 / portTICK_PERIOD_MS); // 5 ms
 	// Configure the IRQ pin as INPUT. Required for correct interrupt setting for ESP8266
-    	pinMode(irq, INPUT);
-	// start SPI
-	SPI.begin();
+    pinMode(irq, INPUT);
+	pinMode(rst, OUTPUT_OPEN_DRAIN);
+	digitalWrite(rst, HIGH);
+	// Ensure a clean SPI re-init after power-cycle: on ESP32 calling begin() on
+	// an already-started SPIClass is a no-op, leaving the peripheral in an
+	// indeterminate state. end() first guarantees a fresh hardware reset.
+	dw1000SPI.end();
+	dw1000SPI.begin(sck, miso, mosi, ss);
 #if !defined(ESP8266) && !defined(ARDUINO_ARCH_ESP32)
-	SPI.usingInterrupt(digitalPinToInterrupt(irq)); // not every board support this, e.g. ESP8266/ESP32
+	dw1000SPI.usingInterrupt(digitalPinToInterrupt(irq));
 #endif
 	// pin and basic member setup
 	_rst        = rst;
 	_irq        = irq;
+	_sck		= sck;
+	_miso		= miso;
+	_mosi		= mosi;
 	_deviceMode = IDLE_MODE;
-	// attach interrupt
-	//attachInterrupt(_irq, DW1000Class::handleInterrupt, CHANGE); // todo interrupt for ESP8266
-	// TODO throw error if pin is not a interrupt pin
-	attachInterrupt(digitalPinToInterrupt(_irq), DW1000Class::handleInterrupt, RISING); // todo interrupt for ESP8266
+	// Detach before re-attaching to prevent duplicate handlers on ESP32 after reset.
+	detachInterrupt(digitalPinToInterrupt(irq));
+	attachInterrupt(digitalPinToInterrupt(irq), DW1000Class::handleInterrupt, RISING);
 }
 
 void DW1000Class::manageLDE() {
@@ -203,7 +225,7 @@ void DW1000Class::manageLDE() {
 	otpctrl[1]   = 0x80;
 	writeBytes(PMSC, PMSC_CTRL0_SUB, pmscctrl0, 2);
 	writeBytes(OTP_IF, OTP_CTRL_SUB, otpctrl, 2);
-	delay(5);
+	vTaskDelay(5 / portTICK_PERIOD_MS); // 5 ms
 	pmscctrl0[0] = 0x00;
 	pmscctrl0[1] &= 0x02;
 	writeBytes(PMSC, PMSC_CTRL0_SUB, pmscctrl0, 2);
@@ -293,7 +315,7 @@ void DW1000Class::deepSleep() {
 
 void DW1000Class::spiWakeup(){
         digitalWrite(_ss, LOW);
-        delay(2);
+		vTaskDelay(2/ portTICK_PERIOD_MS); // 5 ms
         digitalWrite(_ss, HIGH);
         if (_debounceClockEnabled){
                 DW1000Class::enableDebounceClock();
@@ -302,18 +324,27 @@ void DW1000Class::spiWakeup(){
 
 
 void DW1000Class::reset() {
+	// softReset();
 	if(_rst == 0xff) {
 		softReset();
 	} else {
+		// dw1000SPI.end();
+		// 	vTaskDelay(1000 / portTICK_PERIOD_MS); // 5 ms;
+		// reconfigure the pin as output and drive low to reset the chip
 		// dw1000 data sheet v2.08 §5.6.1 page 20, the RSTn pin should not be driven high but left floating.
-		pinMode(_rst, OUTPUT);
 		digitalWrite(_rst, LOW);
-		delay(2);  // dw1000 data sheet v2.08 §5.6.1 page 20: nominal 50ns, to be safe take more time
-		pinMode(_rst, INPUT);
-		delay(10); // dwm1000 data sheet v1.2 page 5: nominal 3 ms, to be safe take more time
-		// force into idle mode (although it should be already after reset)
-		idle();
+		vTaskDelay(1 / portTICK_PERIOD_MS);  // dw1000 data sheet v2.08 §5.6.1 page 20: nominal 50ns, to be safe take more time
+		digitalWrite(_rst, HIGH);
+		vTaskDelay(10 / portTICK_PERIOD_MS); // dwm1000 data sheet v1.2 page 5: nominal 3 ms, to be safe take more time
+
+		// dw1000SPI.begin(_sck, _miso, _mosi, _ss);
+		// dw1000SPI.begin(_sck, _miso, _mosi, _ss);
+		// digitalWrite(8, LOW); 
+		// delay(1000);  // dw1000 data sheet v2.08 §5.6.1 page 20: nominal 50ns, to be safe take more time
+		// digitalWrite(8, HIGH); 
 	}
+	// force into idle mode (although it should be already after reset)
+	idle();
 }
 
 void DW1000Class::softReset() {
@@ -323,7 +354,7 @@ void DW1000Class::softReset() {
 	writeBytes(PMSC, PMSC_CTRL0_SUB, pmscctrl0, LEN_PMSC_CTRL0);
 	pmscctrl0[3] = 0x00;
 	writeBytes(PMSC, PMSC_CTRL0_SUB, pmscctrl0, LEN_PMSC_CTRL0);
-	delay(10);
+	vTaskDelay(10 / portTICK_PERIOD_MS); // 10 ms
 	pmscctrl0[0] = 0x00;
 	pmscctrl0[3] = 0xF0;
 	writeBytes(PMSC, PMSC_CTRL0_SUB, pmscctrl0, LEN_PMSC_CTRL0);
@@ -683,6 +714,9 @@ void DW1000Class::tune() {
 	} else {
 		writeValueToBytes(fsxtalt, ((buf_otp[0] & 0x1F) | 0x60), LEN_FS_XTALT);
 	}
+	
+	writeValueToBytes(txpower, 0x1F1F1F1F, LEN_TX_POWER);
+
 	// write configuration back to chip
 	writeBytes(AGC_TUNE, AGC_TUNE1_SUB, agctune1, LEN_AGC_TUNE1);
 	writeBytes(AGC_TUNE, AGC_TUNE2_SUB, agctune2, LEN_AGC_TUNE2);
@@ -709,34 +743,62 @@ void DW1000Class::tune() {
  * ######################################################################### */
 
 void DW1000Class::handleInterrupt() {
+	_interruptPending = true;
+	Serial.println("Interrupt received");
+}
+
+void DW1000Class::processInterrupt() {
+	if(!_interruptPending) {
+		return;
+	}
+	noInterrupts();
+	_interruptPending = false;
+	interrupts();
+
 	// read current status and handle via callbacks
 	readSystemEventStatusRegister();
 	if(isClockProblem() /* TODO and others */ && _handleError != 0) {
 		(*_handleError)();
+		Serial.println("Error callback called");
 	}
 	if(isTransmitDone() && _handleSent != 0) {
 		(*_handleSent)();
 		clearTransmitStatus();
+		// Re-enable RX after delayed TX completes when permanent-receive
+		// is on and we are in IDLE (i.e. startTransmit skipped startReceive).
+		if(_permanentReceive && _deviceMode != RX_MODE) {
+			newReceive();
+			startReceive();
+		}
+		// Serial.println("Transmit done callback called");
 	}
 	if(isReceiveTimestampAvailable() && _handleReceiveTimestampAvailable != 0) {
 		(*_handleReceiveTimestampAvailable)();
 		clearReceiveTimestampAvailableStatus();
 	}
-	if(isReceiveFailed() && _handleReceiveFailed != 0) {
-		(*_handleReceiveFailed)();
+	if(isReceiveFailed()) {
+		Serial.println("Receive failed");
+		Serial.println(_permanentReceive);
+		if(_handleReceiveFailed != 0) {
+			(*_handleReceiveFailed)();
+		}
 		clearReceiveStatus();
 		if(_permanentReceive) {
 			newReceive();
 			startReceive();
 		}
-	} else if(isReceiveTimeout() && _handleReceiveTimeout != 0) {
-		(*_handleReceiveTimeout)();
+	} else if(isReceiveTimeout()) {
+		// Serial.println("Receive timeout");
+		if(_handleReceiveTimeout != 0) {
+			(*_handleReceiveTimeout)();
+		}
 		clearReceiveStatus();
 		if(_permanentReceive) {
 			newReceive();
 			startReceive();
 		}
 	} else if(isReceiveDone() && _handleReceived != 0) {
+		// Serial.println("Receive done");
 		(*_handleReceived)();
 		clearReceiveStatus();
 		if(_permanentReceive) {
@@ -745,6 +807,7 @@ void DW1000Class::handleInterrupt() {
 		}
 	}
 	// clear all status that is left unhandled
+	// Serial.println("Clearing all unhandled status");
 	clearAllStatus();
 }
 
@@ -756,6 +819,13 @@ void DW1000Class::handleInterrupt() {
 void DW1000Class::getPrintableDeviceIdentifier(char msgBuffer[]) {
 	byte data[LEN_DEV_ID];
 	readBytes(DEV_ID, NO_SUB, data, LEN_DEV_ID);
+	Serial.print(data[3],BIN);
+	Serial.print(" ");
+	Serial.print(data[2],BIN);
+	Serial.print(" ");
+	Serial.print(data[1],BIN);
+	Serial.print(" ");
+	Serial.print(data[0],BIN);
 	sprintf(msgBuffer, "%02X - model: %d, version: %d, revision: %d",
 					(uint16_t)((data[3] << 8) | data[2]), data[1], (data[0] >> 4) & 0x0F, data[0] & 0x0F);
 }
@@ -1052,8 +1122,14 @@ void DW1000Class::startTransmit() {
 	writeTransmitFrameControlRegister();
 	setBit(_sysctrl, LEN_SYS_CTRL, SFCST_BIT, !_frameCheck);
 	setBit(_sysctrl, LEN_SYS_CTRL, TXSTRT_BIT, true);
+	bool isDelayedTx = getBit(_sysctrl, LEN_SYS_CTRL, TXDLYS_BIT);
 	writeBytes(SYS_CTRL, NO_SUB, _sysctrl, LEN_SYS_CTRL);
-	if(_permanentReceive) {
+	if(_permanentReceive && !isDelayedTx) {
+		// For immediate TX we can re-enable RX right away; the DW1000
+		// will enter RX after the ongoing transmission completes.
+		// For delayed TX we must NOT call startReceive() here because
+		// writing RXENAB cancels the pending delayed transmission.
+		// RX is re-enabled in processInterrupt() after TX-done.
 		memset(_sysctrl, 0, LEN_SYS_CTRL);
 		_deviceMode = RX_MODE;
 		startReceive();
@@ -1074,7 +1150,9 @@ void DW1000Class::newConfiguration() {
 void DW1000Class::commitConfiguration() {
 	// write all configurations back to device
 	writeNetworkIdAndDeviceAddress();
+
 	writeSystemConfigurationRegister();
+
 	writeChannelControlRegister();
 	writeTransmitFrameControlRegister();
 	writeSystemEventMaskRegister();
@@ -1103,7 +1181,7 @@ void DW1000Class::suppressFrameCheck(boolean val) {
 void DW1000Class::useSmartPower(boolean smartPower) {
 	_smartPower = smartPower;
 	setBit(_syscfg, LEN_SYS_CFG, DIS_STXP_BIT, !smartPower);
-}
+}                              
 
 DW1000Time DW1000Class::setDelay(const DW1000Time& delay) {
 	if(_deviceMode == TX_MODE) {
@@ -1681,17 +1759,17 @@ void DW1000Class::readBytes(byte cmd, uint16_t offset, byte data[], uint16_t n) 
 			headerLen += 2;
 		}
 	}
-	SPI.beginTransaction(*_currentSPI);
+	dw1000SPI.beginTransaction(*_currentSPI);
 	digitalWrite(_ss, LOW);
 	for(i = 0; i < headerLen; i++) {
-		SPI.transfer(header[i]); // send header
+		dw1000SPI.transfer(header[i]); // send header
 	}
 	for(i = 0; i < n; i++) {
-		data[i] = SPI.transfer(JUNK); // read values
+		data[i] = dw1000SPI.transfer(JUNK); // read values
 	}
 	delayMicroseconds(5);
 	digitalWrite(_ss, HIGH);
-	SPI.endTransaction();
+	dw1000SPI.endTransaction();
 }
 
 // always 4 bytes
@@ -1753,17 +1831,17 @@ void DW1000Class::writeBytes(byte cmd, uint16_t offset, byte data[], uint16_t da
 			headerLen += 2;
 		}
 	}
-	SPI.beginTransaction(*_currentSPI);
+	dw1000SPI.beginTransaction(*_currentSPI);
 	digitalWrite(_ss, LOW);
 	for(i = 0; i < headerLen; i++) {
-		SPI.transfer(header[i]); // send header
+		dw1000SPI.transfer(header[i]); // send header
 	}
 	for(i = 0; i < data_size; i++) {
-		SPI.transfer(data[i]); // write values
+		dw1000SPI.transfer(data[i]); // write values
 	}
 	delayMicroseconds(5);
 	digitalWrite(_ss, HIGH);
-	SPI.endTransaction();
+	dw1000SPI.endTransaction();
 }
 
 

@@ -28,6 +28,7 @@
 //Constructor and destructor
 DW1000Device::DW1000Device() {
 	randomShortAddress();
+	noteActivity();
 }
 
 DW1000Device::DW1000Device(byte deviceAddress[], boolean shortOne) {
@@ -40,6 +41,7 @@ DW1000Device::DW1000Device(byte deviceAddress[], boolean shortOne) {
 		//we have a short address (2 bytes)
 		setShortAddress(deviceAddress);
 	}
+	noteActivity();
 }
 
 DW1000Device::DW1000Device(byte deviceAddress[], byte shortAddress[]) {
@@ -47,6 +49,7 @@ DW1000Device::DW1000Device(byte deviceAddress[], byte shortAddress[]) {
 	setAddress(deviceAddress);
 	//we set the 2 bytes address
 	setShortAddress(shortAddress);
+	noteActivity();
 }
 
 DW1000Device::~DW1000Device() {

@@ -27,8 +27,12 @@ bool isUSBConnected() {
 // (requiere habilitar primero BAT_ADC_EN en caso de circuito de habilitación)
 int readBatteryADC() {
   digitalWrite(BAT_ADC_EN, HIGH);
-  delay(5);
+  vTaskDelay(5 / portTICK_PERIOD_MS); // 5 ms
   int raw = analogRead(BAT_ADC);
   digitalWrite(BAT_ADC_EN, LOW);
   return raw;
+}
+
+void hookBattery(bool enable) {
+  digitalWrite(BAT_HOOK, enable ? HIGH : LOW);
 }

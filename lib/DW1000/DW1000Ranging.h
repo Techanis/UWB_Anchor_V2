@@ -36,34 +36,171 @@
 
 // messages used in the ranging protocol
 #define POLL 0
-#define POLL_ACK 1
+#define POLL_ACK 1 //Response
 #define RANGE 2
 #define RANGE_REPORT 3
 #define RANGE_FAILED 255
 #define BLINK 4
 #define RANGING_INIT 5
+#define SYNC_FRAME 6
 
-#define LEN_DATA 90
+#define LEN_DATA 120
 
 //Max devices we put in the networkDevices array ! Each DW1000Device is 74 Bytes in SRAM memory for now.
-#define MAX_DEVICES 4
+#ifndef MAX_DEVICES
+#define MAX_DEVICES 16
+#endif
+
+// Shared UWB network id (PAN id) used by TAGs and anchors.
+#ifndef DW1000_NETWORK_ID
+#define DW1000_NETWORK_ID 0xDECA
+#endif
+
+// Extra random delay applied on TAG side to reduce synchronized transmissions.
+#ifndef DW1000_TAG_TIMER_JITTER_MS
+#define DW1000_TAG_TIMER_JITTER_MS 25
+#endif
+
+// Seconds between TAG transmission cycles (POLL/RANGE broadcast sequence).
+#ifndef DW1000_TAG_TX_PERIOD_S
+#define DW1000_TAG_TX_PERIOD_S 2
+#endif
+
+// TDMA slot duration and number of slots in one TDMA cycle.
+#ifndef DW1000_TAG_TDMA_SLOT_MS
+#define DW1000_TAG_TDMA_SLOT_MS 120
+#endif
+
+#ifndef DW1000_TAG_TDMA_SLOT_COUNT
+#define DW1000_TAG_TDMA_SLOT_COUNT 8
+#endif
+
+// Extra slotting for TAG response phase (RANGE after POLL_ACK), in microseconds.
+// Effective delayed TX = base + slotIndex * slotWidth.
+#ifndef DW1000_TAG_RESPONSE_SLOT_US
+#define DW1000_TAG_RESPONSE_SLOT_US 500
+#endif
+
+#ifndef DW1000_TAG_RESPONSE_SLOT_COUNT
+#define DW1000_TAG_RESPONSE_SLOT_COUNT DW1000_TAG_TDMA_SLOT_COUNT
+#endif
+
+// Extra awake guard time after a transmission/reception to finish protocol exchanges.
+#ifndef DW1000_TAG_ACTIVE_GUARD_MS
+#define DW1000_TAG_ACTIVE_GUARD_MS 120
+#endif
+
+// Number of warm-up broadcast POLLs at the start of each burst.
+// These run full TWR cycles to stabilise oscillator/PLL and refresh
+// anchor timestamps before the "real" ranging rounds.
+#ifndef DW1000_TAG_BURST_WARMUP_POLLS
+#define DW1000_TAG_BURST_WARMUP_POLLS 1
+#endif
+
+// Number of actual ranging rounds per burst (main measurement cycles).
+#ifndef DW1000_TAG_BURST_RANGING_ROUNDS
+#define DW1000_TAG_BURST_RANGING_ROUNDS 4
+#endif
+
+// Inter-round gap (ms) within a burst.  Allows late RANGE_REPORTs to
+// arrive and separates consecutive POLLs to avoid self-collision.
+#ifndef DW1000_TAG_BURST_ROUND_GAP_MS
+#define DW1000_TAG_BURST_ROUND_GAP_MS 50
+#endif
+
+// Wait time (ms) after the BLINK at the start of each burst before sending
+// the first POLL.  Anchors stagger RANGING_INIT by ~2 ms each; give enough
+// time for all to reply before the TAG begins polling.
+#ifndef DW1000_TAG_BURST_BLINK_WAIT_MS
+#define DW1000_TAG_BURST_BLINK_WAIT_MS 50
+#endif
+
+// Auto-timing mode: when set to 1 the library derives the reply-delay,
+// TDMA slot and TX period automatically from the configured maximum
+// number of anchors and tags at startAsTag() time.
+// Individual -D overrides remain active when auto-timing is disabled.
+#ifndef DW1000_AUTO_TIMING
+#define DW1000_AUTO_TIMING 0
+#endif
+
+// Input parameters for the auto-timing calculation.
+// Set these to the worst-case (maximum) counts you expect to deploy.
+#ifndef DW1000_AUTO_TIMING_MAX_ANCHORS
+#define DW1000_AUTO_TIMING_MAX_ANCHORS 5
+#endif
+
+#ifndef DW1000_AUTO_TIMING_MAX_TAGS
+#define DW1000_AUTO_TIMING_MAX_TAGS 8
+#endif
+
+// TAG power-save mode while waiting next slot/period:
+// 0 = disabled, 1 = idle, 2 = deepSleep/spiWakeup.
+#ifndef DW1000_TAG_POWER_SAVE_MODE
+#define DW1000_TAG_POWER_SAVE_MODE 1
+#endif
+
+// Master anchor synchronization settings.
+#ifndef DW1000_ANCHOR_MASTER_ENABLED
+#define DW1000_ANCHOR_MASTER_ENABLED 0
+#endif
+
+#ifndef DW1000_SYNC_PERIOD_MS
+#define DW1000_SYNC_PERIOD_MS 1000
+#endif
+
+#ifndef DW1000_SYNC_TIMEOUT_MS
+#define DW1000_SYNC_TIMEOUT_MS 5000
+#endif
+
+#ifndef DW1000_TAG_REQUIRE_SYNC
+#define DW1000_TAG_REQUIRE_SYNC 1
+#endif
 
 //Default Pin for module:
 #define DEFAULT_RST_PIN 4
 #define DEFAULT_SPI_SS_PIN 10
 
 //Default value
-//in ms
-#define DEFAULT_RESET_PERIOD 200
-//in us
-#define DEFAULT_REPLY_DELAY_TIME 7000
+//in ms  –  Must exceed the longest possible ranging cycle at the
+//          configured data rate.  At 110 kbps a single POLL→RANGE_REPORT
+//          exchange with 5 anchors can easily take 300+ ms.
+#define DEFAULT_RESET_PERIOD 1000
+//in us  –  Separate anchor response timings.
+// POLL_ACK uses odd slots: (2*i+1) * DW1000_ANCHOR_POLL_ACK_BASE_DELAY_US.
+// Effective gap between consecutive anchors = 2 * base.
+#ifndef DW1000_ANCHOR_POLL_ACK_BASE_DELAY_US
+#define DW1000_ANCHOR_POLL_ACK_BASE_DELAY_US 5000
+#endif
 
+// RANGE_REPORT is slightly larger than POLL_ACK, so it can use a slightly
+// bigger base delay while preserving the same slot ordinal (1, 3, 5, ...).
+#ifndef DW1000_ANCHOR_RANGE_REPORT_BASE_DELAY_US
+#define DW1000_ANCHOR_RANGE_REPORT_BASE_DELAY_US 6000
+#endif
+
+// RANGING_INIT is sent after BLINK discovery. Anchors are staggered with a
+// simple linear slot (i * this value), so this should be >= the frame airtime
+// plus a small processing margin.
+#ifndef DW1000_ANCHOR_RANGING_INIT_SLOT_US
+#define DW1000_ANCHOR_RANGING_INIT_SLOT_US 5000
+#endif
+
+// Backward-compatible fallback used where a single base delay is needed.
+#ifndef DEFAULT_REPLY_DELAY_TIME
+#define DEFAULT_REPLY_DELAY_TIME DW1000_ANCHOR_POLL_ACK_BASE_DELAY_US
+#endif
 //sketch type (anchor or tag)
 #define TAG 0
 #define ANCHOR 1
 
-//default timer delay
-#define DEFAULT_TIMER_DELAY 80
+//default timer delay  –  Must cover the full round-trip at 110 kbps.
+//  Base 150 ms + per-device overhead added at runtime in transmitPoll/Range.
+#define DEFAULT_TIMER_DELAY 1
+
+// Maximum physically plausible range (metres).  Measurements beyond this
+// threshold are discarded as invalid (multipath, clock errors, etc.).
+// DW1000 theoretical max is ~290 m indoors / ~60 m NLOS; 300 m provides margin.
+#define MAX_VALID_RANGE_METERS 300.0f
 
 //debug mode
 #ifndef DEBUG
@@ -79,8 +216,9 @@ public:
 	
 	//initialisation
 	static void    initCommunication(uint8_t myRST = DEFAULT_RST_PIN, uint8_t mySS = DEFAULT_SPI_SS_PIN, uint8_t myIRQ = 2);
-	static void    configureNetwork(uint16_t deviceAddress, uint16_t networkId, const byte mode[]);
-	static void    generalStart();
+    void initCommunication(uint8_t myRST, uint8_t mySS, uint8_t myIRQ, uint8_t sck, uint8_t miso, uint8_t mosi, uint8_t ss);
+    static void configureNetwork(uint16_t deviceAddress, uint16_t networkId, const byte mode[]);
+    static void    generalStart();
 	static void    startAsAnchor(char address[], const byte mode[], const bool randomShortAddress = true);
 	static void    startAsTag(char address[], const byte mode[], const bool randomShortAddress = true);
 	static boolean addNetworkDevices(DW1000Device* device, boolean shortAddress);
@@ -102,6 +240,13 @@ public:
 	static int16_t detectMessageType(byte datas[]); // TODO check return type
 	static void loop();
 	static void useRangeFilter(boolean enabled);
+	// Re-arm receiver mode explicitly (useful after runtime reconfiguration).
+	static void forceReceiverMode();
+	// Diagnostics helpers to inspect link health after resets.
+	static uint32_t getRxEventCount() { return _rxEventCount; };
+	static uint32_t getTxEventCount() { return _txEventCount; };
+	static uint32_t getLastRxEventMs() { return _lastRxEventMs; };
+	static uint32_t getLastTxEventMs() { return _lastTxEventMs; };
 	// Used for the smoothing algorithm (Exponential Moving Average). newValue must be >= 2. Default 15.
 	static void setRangeFilterValue(uint16_t newValue);
 	
@@ -149,6 +294,11 @@ private:
 	// message sent/received state
 	static volatile boolean _sentAck;
 	static volatile boolean _receivedAck;
+	// Diagnostics counters and last event timestamps.
+	static volatile uint32_t _rxEventCount;
+	static volatile uint32_t _txEventCount;
+	static uint32_t _lastRxEventMs;
+	static uint32_t _lastTxEventMs;
 	// protocol error state
 	static boolean          _protocolFailed;
 	// reset line to the chip
@@ -167,6 +317,34 @@ private:
 	//ranging filter
 	static volatile boolean _useRangeFilter;
 	static uint16_t         _rangeFilterValue;
+	// TAG scheduling and low-power
+	static uint32_t _tagTxPeriodMs;
+	static uint16_t _tagTDMASlotMs;
+	static uint8_t  _tagTDMASlotCount;
+	static uint8_t  _tagOwnSlotIndex;
+	static uint32_t _tagNextTxDueMs;
+	static uint32_t _tagKeepAwakeUntilMs;
+	static boolean  _tagPowerSaveActive;
+	// Deadline by which RANGE must be sent even if not all POLL_ACKs have arrived.
+	// Set when a broadcast POLL is sent; cleared when RANGE is actually transmitted.
+	// 0 = no deadline active.
+	static uint32_t _tagPollAckDeadlineMs;
+	// Burst state
+	static bool     _tagBurstActive;
+	static bool     _tagBurstBlinkPhase;       // true while waiting for RANGING_INITs after burst BLINK
+	static uint32_t _tagBurstBlinkDeadlineMs;  // when BLINK phase ends
+	static uint8_t  _tagBurstRoundsRemaining;
+	static uint8_t  _tagBurstWarmupRemaining;
+	static uint32_t _tagBurstRoundDeadlineMs;
+	static uint32_t _baseReplyDelayUS;         // POLL_ACK base delay (µs)
+	static uint32_t _rangeReportBaseDelayUS;   // RANGE_REPORT base delay (µs)
+	static uint32_t _rangingInitSlotUS;        // RANGING_INIT slot spacing (µs)
+	static boolean  _anchorMasterEnabled;
+	static uint32_t _syncPeriodMs;
+	static uint32_t _anchorNextSyncMs;
+	static boolean  _tagSyncValid;
+	static uint32_t _tagLastSyncRxMs;
+	static int32_t  _tagEpochOffsetMs;
 	//_bias correction
 	static char  _bias_RSL[17]; // TODO remove or use
 	//17*2=34 bytes in SRAM
@@ -185,11 +363,19 @@ private:
 	static void checkForReset();
 	static void checkForInactiveDevices();
 	static void copyShortAddress(byte address1[], byte address2[]);
+	static bool isTagTransmissionWindow(uint32_t nowMs);
+	static void armTagNextTransmission(uint32_t nowMs);
+	static void enterTagPowerSave();
+	static void exitTagPowerSave();
+	static void startNextBurstRound();
+	static void completeBurstRound();
+	static void computeAutoTiming(uint8_t maxAnchors, uint8_t maxTags);
+	static void transmitSync();
 	
 	//for ranging protocole (ANCHOR)
 	static void transmitInit();
-	static void transmit(byte datas[]);
-	static void transmit(byte datas[], DW1000Time time);
+	static void transmit(byte datas[], uint16_t dataLength);
+	static void transmit(byte datas[], uint16_t dataLength, DW1000Time time);
 	static void transmitBlink();
 	static void transmitRangingInit(DW1000Device* myDistantDevice);
 	static void transmitPollAck(DW1000Device* myDistantDevice);

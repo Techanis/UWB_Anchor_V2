@@ -27,6 +27,10 @@
 
 //Constructor and destructor
 
+DW1000Mac::DW1000Mac(DW1000Device* parent) {
+	_seqNumber = 0;
+}
+
 DW1000Mac::DW1000Mac() {
 	_seqNumber = 0;
 }
@@ -65,10 +69,10 @@ void DW1000Mac::generateShortMACFrame(byte frame[], byte sourceShortAddress[], b
 	*(frame+1) = FC_2_SHORT;
 	//sequence number (11.3) modulo 256
 	*(frame+2) = _seqNumber;
-	//PAN ID
-	*(frame+3) = 0xCA;
-	*(frame+4) = 0xDE;
-	
+	// PAN ID from configured network id (little-endian on the frame)
+	const uint16_t panId = DW1000_NETWORK_ID;
+	*(frame+3) = static_cast<byte>(panId & 0xFF);
+	*(frame+4) = static_cast<byte>((panId >> 8) & 0xFF);
 	
 	//destination address (2 bytes)
 	byte destinationShortAddressReverse[2];
@@ -94,9 +98,10 @@ void DW1000Mac::generateLongMACFrame(byte frame[], byte sourceShortAddress[], by
 	*(frame+1) = FC_2;
 	//sequence number
 	*(frame+2) = _seqNumber;
-	//PAN ID (0xDECA)
-	*(frame+3) = 0xCA;
-	*(frame+4) = 0xDE;
+	// PAN ID from configured network id (little-endian on the frame)
+	const uint16_t panId = DW1000_NETWORK_ID;
+	*(frame+3) = static_cast<byte>(panId & 0xFF);
+	*(frame+4) = static_cast<byte>((panId >> 8) & 0xFF);
 	
 	//destination address (8 bytes) - we need to reverse the byte array
 	byte destinationAddressReverse[8];

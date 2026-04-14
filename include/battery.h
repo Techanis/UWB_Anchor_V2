@@ -7,19 +7,12 @@
 extern "C" {
 #endif
 
-// Pines personalizados para ESP32-S3
-#define USB_CONNECTED 15
-#define BAT_HOOK 16
-#define BAT_ADC_EN 17
-#define BAT_ADC   18
-
-
 // Prototipos
 void initBatteryPins();
 bool isUSBConnected();
 int readBatteryADC();
-
-
+// Habilita o deshabilita la alimentación por batería (si no hay USB conectado)
+void hookBattery(bool enable); 
 // Instancias compartidas
 
 

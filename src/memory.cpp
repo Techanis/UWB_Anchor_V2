@@ -1,9 +1,10 @@
 #include "memory.h"
 
-SPIClass memorySPI; // default HSPI (o el que configure el core)
+SPIClass memorySPI(HSPI); // default HSPI (o el que configure el core)
 SPIFlash flash(FLASH_CS, &memorySPI);
 
 void beginCustomSPI() {
+  memorySPI.end(); // Aseguramos que no esté inicializado con otros pines
   memorySPI.begin(FLASH_SCK, FLASH_MISO, FLASH_MOSI, FLASH_CS);
 }
 
