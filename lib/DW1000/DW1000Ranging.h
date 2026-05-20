@@ -139,11 +139,6 @@
 #define DW1000_TAG_POWER_SAVE_MODE 1
 #endif
 
-// Master anchor synchronization settings.
-#ifndef DW1000_ANCHOR_MASTER_ENABLED
-#define DW1000_ANCHOR_MASTER_ENABLED 0
-#endif
-
 #ifndef DW1000_SYNC_PERIOD_MS
 #define DW1000_SYNC_PERIOD_MS 1000
 #endif
@@ -235,6 +230,8 @@ public:
 	static byte* getCurrentShortAddress() { return _currentShortAddress; };
 	
 	static uint8_t getNetworkDevicesNumber() { return _networkDevicesNumber; };
+
+	static bool isTagBurstActive() { return _tagBurstActive; };
 	
 	//ranging functions
 	static int16_t detectMessageType(byte datas[]); // TODO check return type
@@ -351,7 +348,7 @@ private:
 	static int16_t _bias_PRF_16[17]; // TODO remove or use
 	//17 bytes in SRAM
 	static char  _bias_PRF_64[17]; // TODO remove or use
-	
+	static bool  _rangeFailed; // Flag to indicate if a RANGE_FAILED message was received in the current cycle.
 	
 	//methods
 	static void handleSent();

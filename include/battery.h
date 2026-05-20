@@ -7,12 +7,16 @@
 extern "C" {
 #endif
 
+#define NUM_MUESTRAS 32
+
+
 // Prototipos
 void initBatteryPins();
 bool isUSBConnected();
 int readBatteryADC();
 // Habilita o deshabilita la alimentación por batería (si no hay USB conectado)
 void hookBattery(bool enable); 
+uint32_t readBatteryVoltageMv(); // Lee el voltaje de batería en mV
 // Instancias compartidas
 
 

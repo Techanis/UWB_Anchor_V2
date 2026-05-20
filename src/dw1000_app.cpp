@@ -1,24 +1,36 @@
 #include "dw1000_app.h"
 #include "config.h"
-
+#include "calc_dist.h"
 #include "DW1000Ranging.h"
 
 #include <cstring>
 
-// Adaptación a modo máximo alcance: modo largo, PRF 64MHz, baja tasa
-static const byte DW1000_MAX_RANGE_MODE[] = {DW1000Class::TRX_RATE_110KBPS, DW1000Class::TX_PULSE_FREQ_64MHZ, DW1000Class::TX_PREAMBLE_LEN_2048};
+
+// 110 kbps, PRF 64 MHz, Preámbulo 4096 — máximo alcance / mínimo ruido de tiempo
+// DW1000 UM: preamble ≥1024 sólo válido para 110 kbps.
+// Airtime estimado @4096: SHR≈4310µs | PHR≈48µs | +73µs/byte
+//   POLL_ACK(12B)≈5234µs  RANGE_REPORT(20B)≈5818µs  RANGING_INIT-master(22B)≈5964µs  BLINK(14B)≈5380µs
+// (Con preámbulo 2048 los mismos frames eran ≈3150/3734/3880/3296 µs respectivamente)
+static const byte DW1000_MAX_RANGE_MODE[] = {DW1000Class::TRX_RATE_110KBPS, DW1000Class::TX_PULSE_FREQ_64MHZ, DW1000Class::TX_PREAMBLE_LEN_4096};
 static const uint8_t DW1000_INIT_MAX_ATTEMPTS = 10;
-static const uint16_t DW1000_POWER_CYCLE_DELAY_MS = 50;
+static const uint16_t DW1000_POWER_CYCLE_DELAY_MS = 2000;
 static const uint16_t DW1000_BOOT_SETTLE_MS = 1000;
 static const uint32_t DW1000_DIAG_REPORT_INTERVAL_MS = 2000;
-
+static const uint8_t UWB_TOTAL_BURST_ROUNDS =
+    DW1000_TAG_BURST_WARMUP_POLLS + DW1000_TAG_BURST_RANGING_ROUNDS;
 static bool g_dw1000Ready = false;
+const String anchorPrefix= SENSOR_PREFIX;
 
 struct AnchorRangeEntry {
     bool active;
     uint16_t shortAddress;
     float distanceMeters;
+    float medianDistanceMeters;
+    float estimatedDistanceMeters;
     uint32_t lastUpdateMs;
+    float roundSamples[UWB_TOTAL_BURST_ROUNDS];
+    uint8_t sampleCount;
+    uint8_t nextSampleIndex;
 };
 
 static AnchorRangeEntry g_anchorRanges[UWB_MAX_ACTIVE_ANCHORS] = {};
@@ -29,6 +41,7 @@ static uint32_t g_prueba = 0;
 static uint32_t g_lastBlinkRxMs = 0;
 static uint32_t g_blinkRxCount = 0;
 static uint32_t g_lastDiagReportMs = 0;
+static bool g_twdtSubscribed = false;
 
 static const char* localRoleLabel() {
 #if UWB_ROLE_ANCHOR
@@ -53,19 +66,72 @@ static const char* remoteRoleLabelPlural() {
     return "Anclas activas";
 #endif
 }
+static void printDW1000DiagnosticsIfNeeded() {
+#if UWB_ROLE_ANCHOR
+    uint32_t now = millis();
+    if (now - g_lastDiagReportMs < DW1000_DIAG_REPORT_INTERVAL_MS) {
+        return;
+    }
+    g_lastDiagReportMs = now;
+
+    uint32_t rxEvents = DW1000Ranging.getRxEventCount();
+    uint32_t txEvents = DW1000Ranging.getTxEventCount();
+    uint32_t lastRxMs = DW1000Ranging.getLastRxEventMs();
+    uint32_t lastTxMs = DW1000Ranging.getLastTxEventMs();
+    uint32_t sinceBlinkMs = (g_lastBlinkRxMs == 0) ? 0 : (now - g_lastBlinkRxMs);
+    uint8_t activeTags = 0;
+    for (int i = 0; i < UWB_MAX_ACTIVE_ANCHORS; ++i) {
+        if (g_anchorRanges[i].active) {
+            ++activeTags;
+        }
+    }
+
+    Serial.printf("[DW1000 DIAG] irq=%d rxEvt=%lu txEvt=%lu lastRxAgoMs=%lu lastTxAgoMs=%lu blinkCnt=%lu blinkAgoMs=%lu activeTags=%u\n",
+        digitalRead(DW1000_IRQ),
+        (unsigned long)rxEvents,
+        (unsigned long)txEvents,
+        (unsigned long)((lastRxMs == 0) ? 0 : (now - lastRxMs)),
+        (unsigned long)((lastTxMs == 0) ? 0 : (now - lastTxMs)),
+        (unsigned long)g_blinkRxCount,
+        (unsigned long)sinceBlinkMs,
+        activeTags);
+#endif
+}
+static void feedSystemWatchdog() {
+    if (g_twdtSubscribed) {
+        esp_task_wdt_reset();
+    }
+}
+
+static void initSystemWatchdog() {
+    // esp_task_wdt_init() acepta ser llamado cuando el TWDT ya está activo;
+    // en ese caso solo actualiza el timeout y el flag de pánico.
+    // El timeout es en segundos (API ESP-IDF v4.x).
+    esp_task_wdt_init(UWB_CPU_WATCHDOG_TIMEOUT_MS / 1000, true);
+    esp_task_wdt_add(NULL); // suscribe la tarea actual (Task1)
+    g_twdtSubscribed = true;
+    esp_task_wdt_reset();   // alimentación inicial
+}
+
+static void markRemoteSeenNow() {
+    g_lastRemoteSeenMs = millis();
+    feedSystemWatchdog();
+}
 
 static void applyRuntimeRadioSettings() {
     // `setAntennaDelay()` solo actualiza el valor en memoria; para que el
     // DW1000 lo use realmente hay que reescribir la configuración al chip.
     DW1000.newConfiguration();
     DW1000.useSmartPower(false);
+    DW1000.setChannel(DW1000_CHANNEL);
     DW1000.setAntennaDelay(UWB_ACTIVE_ANTENNA_DELAY);
+
+    // DW1000.setPreambleCode(DW1000Class::PREAMBLE_CODE_64MHZ_10);
+    // DW1000.enableMode(DW1000_MAX_RANGE_MODE);
+
     DW1000.commitConfiguration();
 
-    Serial.print("[DW1000 ");
-    Serial.print(localRoleLabel());
-    Serial.print("] Calibración de antena aplicada: ");
-    Serial.println(UWB_ACTIVE_ANTENNA_DELAY);
+    Serial.printf("[DW1000 %s] Calibración de antena aplicada: %u\n", localRoleLabel(), (unsigned)UWB_ACTIVE_ANTENNA_DELAY);
 }
 
 static int findAnchorIndex(uint16_t shortAddress) {
@@ -100,7 +166,7 @@ static int findOldestAnchorSlot() {
     return (oldestIndex >= 0) ? oldestIndex : 0;
 }
 
-static void upsertAnchorRange(uint16_t shortAddress, float distanceMeters) {
+static int allocateAnchorSlot(uint16_t shortAddress) {
     int index = findAnchorIndex(shortAddress);
     if (index < 0) {
         index = findFreeAnchorSlot();
@@ -109,11 +175,48 @@ static void upsertAnchorRange(uint16_t shortAddress, float distanceMeters) {
         // Si se supera el limite configurado, reciclamos la entrada mas antigua.
         index = findOldestAnchorSlot();
     }
+    return index;
+}
 
-    g_anchorRanges[index].active = true;
-    g_anchorRanges[index].shortAddress = shortAddress;
-    g_anchorRanges[index].distanceMeters = distanceMeters;
-    g_anchorRanges[index].lastUpdateMs = millis();
+static void updateAnchorDistanceEstimate(AnchorRangeEntry& entry) {
+    entry.medianDistanceMeters = calcularMediana(entry.roundSamples, entry.sampleCount);
+    entry.estimatedDistanceMeters = estimarDistanciaRobusta(entry.roundSamples, entry.sampleCount);
+}
+
+static void addSampleToAnchor(AnchorRangeEntry& entry, float distanceMeters) {
+    entry.roundSamples[entry.nextSampleIndex] = distanceMeters;
+    entry.nextSampleIndex = (entry.nextSampleIndex + 1U) % UWB_TOTAL_BURST_ROUNDS;
+    if (entry.sampleCount < UWB_TOTAL_BURST_ROUNDS) {
+        ++entry.sampleCount;
+    }
+    updateAnchorDistanceEstimate(entry);
+}
+
+static void formatNtpTimestamp(char* buffer, size_t bufferSize) {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        snprintf(buffer, bufferSize, "1970-01-01T00:00:00");
+        return;
+    }
+
+    strftime(buffer, bufferSize, "%Y-%m-%d %H:%M:%S", &timeinfo);
+}
+
+static void upsertAnchorRange(uint16_t shortAddress, float distanceMeters) {
+    const int index = allocateAnchorSlot(shortAddress);
+    AnchorRangeEntry& entry = g_anchorRanges[index];
+
+    if (!entry.active || entry.shortAddress != shortAddress) {
+        entry = {};
+        entry.shortAddress = shortAddress;
+    }
+
+    entry.active = true;
+    entry.shortAddress = shortAddress;
+    entry.distanceMeters = distanceMeters;
+    entry.lastUpdateMs = millis();
+    // Serial.println("[DW1000 TAG] Rango recibido: " + String(distanceMeters, 3) + " m de ancla 0x" + String(shortAddress, HEX));
+    addSampleToAnchor(entry, distanceMeters);
     g_anchorTableDirty = true;
 }
 
@@ -121,63 +224,27 @@ static void markAnchorInactive(uint16_t shortAddress) {
     int index = findAnchorIndex(shortAddress);
     if (index >= 0) {
         g_anchorRanges[index].active = false;
+        g_anchorRanges[index].distanceMeters = 0.0f;
+        g_anchorRanges[index].medianDistanceMeters = 0.0f;
+        g_anchorRanges[index].estimatedDistanceMeters = 0.0f;
+        g_anchorRanges[index].sampleCount = 0;
+        g_anchorRanges[index].nextSampleIndex = 0;
         g_anchorTableDirty = true;
     }
 }
 
 static void touchAnchor(uint16_t shortAddress) {
-    int index = findAnchorIndex(shortAddress);
-    if (index >= 0) {
-        g_anchorRanges[index].active = true;
-        g_anchorRanges[index].lastUpdateMs = millis();
-        g_anchorTableDirty = true;
-        return;
+    const int index = allocateAnchorSlot(shortAddress);
+    AnchorRangeEntry& entry = g_anchorRanges[index];
+
+    if (!entry.active || entry.shortAddress != shortAddress) {
+        entry = {};
+        entry.shortAddress = shortAddress;
     }
-
-    upsertAnchorRange(shortAddress, 0.0f);
-}
-
-
-static void printDW1000DiagnosticsIfNeeded() {
-#if UWB_ROLE_ANCHOR
-    uint32_t now = millis();
-    if (now - g_lastDiagReportMs < DW1000_DIAG_REPORT_INTERVAL_MS) {
-        return;
-    }
-    g_lastDiagReportMs = now;
-
-    uint32_t rxEvents = DW1000Ranging.getRxEventCount();
-    uint32_t txEvents = DW1000Ranging.getTxEventCount();
-    uint32_t lastRxMs = DW1000Ranging.getLastRxEventMs();
-    uint32_t lastTxMs = DW1000Ranging.getLastTxEventMs();
-    uint32_t sinceBlinkMs = (g_lastBlinkRxMs == 0) ? 0 : (now - g_lastBlinkRxMs);
-    uint8_t activeTags = 0;
-    for (int i = 0; i < UWB_MAX_ACTIVE_ANCHORS; ++i) {
-        if (g_anchorRanges[i].active) {
-            ++activeTags;
-        }
-    }
-
-    Serial.print("[DW1000 DIAG] irq=");
-    Serial.print(digitalRead(DW1000_IRQ));
-    Serial.print(" rxEvt=");
-    Serial.print(rxEvents);
-    Serial.print(" txEvt=");
-    Serial.print(txEvents);
-    Serial.print(" lastRxAgoMs=");
-    Serial.print((lastRxMs == 0) ? 0 : (now - lastRxMs));
-    Serial.print(" lastTxAgoMs=");
-    Serial.print((lastTxMs == 0) ? 0 : (now - lastTxMs));
-    Serial.print(" blinkCnt=");
-    Serial.print(g_blinkRxCount);
-    Serial.print(" blinkAgoMs=");
-    Serial.print(sinceBlinkMs);
-    Serial.print(" activeTags=");
-    Serial.println(activeTags);
-#endif
-}
-static void markRemoteSeenNow() {
-    g_lastRemoteSeenMs = millis();
+    
+    entry.active = true;
+    entry.lastUpdateMs = millis();
+    g_anchorTableDirty = true;
 }
 
 static void removeStaleAnchors() {
@@ -205,33 +272,23 @@ static uint8_t countActiveAnchors() {
 
 static void printAnchorRangesIfNeeded() {
     uint32_t now = millis();
-    if (!g_anchorTableDirty || (now - g_lastAnchorReportMs < UWB_ANCHOR_REPORT_INTERVAL_MS)) {
-        return;
-    }
-
-    g_lastAnchorReportMs = now;
     g_anchorTableDirty = false;
 
     uint8_t activeCount = countActiveAnchors();
-    Serial.print("[DW1000 ");
-    Serial.print(localRoleLabel());
-    Serial.print("] ");
-    Serial.print(remoteRoleLabelPlural());
-    Serial.print(": ");
-    Serial.println(activeCount);
+    Serial.printf("[DW1000 %s] %s: %u\n", localRoleLabel(), remoteRoleLabelPlural(), activeCount);
 
     for (int i = 0; i < UWB_MAX_ACTIVE_ANCHORS; ++i) {
         if (!g_anchorRanges[i].active) {
             continue;
         }
-
-        Serial.print("  - 0x");
-        Serial.print(g_anchorRanges[i].shortAddress, HEX);
-        Serial.print(": ");
-        Serial.print(g_anchorRanges[i].distanceMeters, 3);
-        Serial.print(" m (hace ");
-        Serial.print(now - g_anchorRanges[i].lastUpdateMs);
-        Serial.println(" ms)");
+        Serial.printf("  - 0x%X: ult=%.3f m, mediana=%.3f m, estimada=%.3f m (%u/%u rondas, hace %lu ms)\n",
+            g_anchorRanges[i].shortAddress,
+            g_anchorRanges[i].distanceMeters,
+            g_anchorRanges[i].medianDistanceMeters,
+            g_anchorRanges[i].estimatedDistanceMeters,
+            g_anchorRanges[i].sampleCount,
+            (unsigned)UWB_TOTAL_BURST_ROUNDS,
+            (unsigned long)(now - g_anchorRanges[i].lastUpdateMs));
     }
 }
 
@@ -249,8 +306,8 @@ static void clearAnchorRanges() {
 static bool isDW1000IdValid() {
     char msg[96];
     DW1000.getPrintableDeviceIdentifier(msg);
-    SERIAL_LOG.print("ID:  ");
-    SERIAL_LOG.println(msg);
+    Serial.print("ID:  ");
+    Serial.println(msg);
     return std::strncmp(msg, "DECA", 4) == 0;
 }
 
@@ -271,14 +328,11 @@ static bool initDW1000CommunicationWithRetry() {
         Serial.print("/");
         Serial.println(DW1000_INIT_MAX_ATTEMPTS);
         DW1000.end();
-        
-        detachInterrupt(digitalPinToInterrupt(DW1000_IRQ));
+
         desenergizeDW1000();
-        vTaskDelay(DW1000_POWER_CYCLE_DELAY_MS / portTICK_PERIOD_MS); // 50 ms
+        vTaskDelay(DW1000_POWER_CYCLE_DELAY_MS / portTICK_PERIOD_MS); // 2000 ms
         energizeDW1000();
         vTaskDelay(DW1000_BOOT_SETTLE_MS / portTICK_PERIOD_MS); // 1000 ms
-	    vTaskDelay(500 / portTICK_PERIOD_MS); 
-
 
         pulseDW1000Reset();
         DW1000Ranging.initCommunication(DW1000_RST, DW1000_SS, DW1000_IRQ,
@@ -293,7 +347,6 @@ static bool initDW1000CommunicationWithRetry() {
         Serial.println("[DW1000][INIT] ID invalida. Reintentando...");
         DW1000.end();
     
-
     }
     desenergizeDW1000();
     ESP.restart();
@@ -329,12 +382,8 @@ static void handleNewDevice(DW1000Device* device) {
     if (device != nullptr) {
         touchAnchor(device->getShortAddress());
         markRemoteSeenNow();
-        Serial.print("[DW1000 ");
-        Serial.print(localRoleLabel());
-        Serial.print("] ");
-        Serial.print(remoteRoleLabelSingular());
-        Serial.print(" detectado: 0x");
-        Serial.println(device->getShortAddress(), HEX);
+        Serial.printf("[DW1000 %s] %s detectado: 0x%X\n",
+            localRoleLabel(), remoteRoleLabelSingular(), device->getShortAddress());
     }
 }
 
@@ -344,23 +393,15 @@ static void handleBlinkDevice(DW1000Device* device) {
         markRemoteSeenNow();
         g_blinkRxCount++;
         g_lastBlinkRxMs = millis();
-        Serial.print("[DW1000 ");
-        Serial.print(localRoleLabel());
-        Serial.print("] BLINK recibido de ");
-        Serial.print(remoteRoleLabelSingular());
-        Serial.print(": 0x");
-        Serial.println(device->getShortAddress(), HEX);
+        Serial.printf("[DW1000 %s] BLINK recibido de %s: 0x%X\n",
+            localRoleLabel(), remoteRoleLabelSingular(), device->getShortAddress());
     }
 }
 
 static void handleInactiveDevice(DW1000Device* device) {
     if (device != nullptr) {
-        Serial.print("[DW1000 ");
-        Serial.print(localRoleLabel());
-        Serial.print("] ");
-        Serial.print(remoteRoleLabelSingular());
-        Serial.print(" inactivo: 0x");
-        Serial.println(device->getShortAddress(), HEX);
+        Serial.printf("[DW1000 %s] %s inactivo: 0x%X\n",
+            localRoleLabel(), remoteRoleLabelSingular(), device->getShortAddress());
         markAnchorInactive(device->getShortAddress());
     }
 }
@@ -418,7 +459,7 @@ void initializeDW1000() {
     runDW1000BootSelfTest();
 
     // Asegurar actualización periódica
-    DW1000Ranging.useRangeFilter(false);
+    // DW1000Ranging.useRangeFilter(false);
     g_lastRemoteSeenMs = millis();
     g_lastBlinkRxMs = 0;
     g_blinkRxCount = 0;
@@ -427,7 +468,7 @@ void initializeDW1000() {
 }
 
 static void resetDW1000Module() {
-    Serial.println("[DW1000][WATCHDOG] Sin remotos activos por 10s. Reiniciando modulo UWB...");
+    Serial.println("[DW1000][WATCHDOG] Sin remotos activos. Reiniciando modulo UWB...");
 
     g_dw1000Ready = false;
     clearAnchorRanges();
@@ -441,11 +482,18 @@ static void resetDW1000Module() {
 }
 
 void setupDW1000() {
+    // Crear el semáforo binario del ISR del DW1000 una única vez antes de
+    // que pueda dispararse la interrupción. Si se crea NULL, xSemaphoreGiveFromISR
+    // hace un assert fatal.
+    if (buttonSemaphore == NULL) {
+        buttonSemaphore = xSemaphoreCreateBinary();
+    }
+
     //Energizamos el módulo UWB
     Serial.println("[DW1000] Inicializando módulo UWB...");
     pinMode(UWB_EN, OUTPUT);
     desenergizeDW1000();
-
+    vTaskDelay(3000 / portTICK_PERIOD_MS); // 100 ms
     // Pines de control ya definidos en config.h
     pinMode(DW1000_SS, OUTPUT);
     digitalWrite(DW1000_SS, HIGH); // Desactivar el chip select al inicio
@@ -457,8 +505,8 @@ void setupDW1000() {
     pinMode(DW1000_IRQ, INPUT);
     
     // Pines adicionales de control (WAKEUP y EXTON)
-    // pinMode(DW1000_WAKEUP, OUTPUT);
-    // digitalWrite(DW1000_WAKEUP, LOW);
+    pinMode(DW1000_WAKEUP, OUTPUT);
+    digitalWrite(DW1000_WAKEUP, LOW);
     pinMode(DW1000_EXTON, INPUT);
 
     // Inicialización robusta del módulo con validación de ID y reintentos.s
@@ -469,27 +517,59 @@ void setupDW1000() {
 }
 
 void loopDW1000() {
+    if (!g_twdtSubscribed) {
+        initSystemWatchdog();
+    }
     if (!g_dw1000Ready) {
         return;
     }
-
-    DW1000.processInterrupt();
-    DW1000Ranging.loop();
-    removeStaleAnchors();
-
-    // if (countActiveAnchors() == 0 && (millis() - g_lastRemoteSeenMs) >= UWB_NO_REMOTE_RESET_TIMEOUT_MS) {
-    //     resetDW1000Module();
-    //     return;
-    // }
-
-    if ( (millis() - g_prueba) >= 10000) {
-        resetDW1000Module();
-        g_prueba = millis();
-        return;
+    // Serial.println("[DW1000] Loop principal ejecutándose...");
+    if (xSemaphoreTake(buttonSemaphore,pdMS_TO_TICKS(1)) == pdTRUE) {
+        DW1000.processInterrupt();
+        DW1000Ranging.loop();
+        removeStaleAnchors();
+    } else{
+        DW1000Ranging.loop();
+        removeStaleAnchors();
     }
 
-    // printDW1000DiagnosticsIfNeeded();
-    printAnchorRangesIfNeeded();
+    // vTaskDelay(1/ portTICK_PERIOD_MS); // Evitar bloqueo total del loop
+#if UWB_ROLE_ANCHOR
+    if (g_anchorTableDirty) {
+        bool shouldPrint = false;
+        bool anyActive = false;
+        bool allDone = true;
+        uint32_t now = millis();
+        for (int i = 0; i < UWB_MAX_ACTIVE_ANCHORS; ++i) {
+            if (!g_anchorRanges[i].active) continue;
+            anyActive = true;
+            // Este tag aún no terminó sus rondas y no ha agotado el timeout
+            if (g_anchorRanges[i].sampleCount < UWB_TOTAL_BURST_ROUNDS &&
+                now - g_anchorRanges[i].lastUpdateMs <= 500) {
+                allDone = false;
+            }
+        }
+        shouldPrint = anyActive && allDone;
+        if (shouldPrint) {
+            // printAnchorRangesIfNeeded();
+            for (int i = 0; i < UWB_MAX_ACTIVE_ANCHORS; ++i) {
+                if (g_anchorRanges[i].active) {
+                    g_anchorRanges[i].sampleCount = 0;
+                    g_anchorRanges[i].nextSampleIndex = 0;
+                }
+            }
+        }
+    }
+#else
+    static bool s_prevBurstActive = false;
+    const bool burstActive = DW1000Ranging.isTagBurstActive();
+    if (s_prevBurstActive && !burstActive) {
+        Serial.println("[DW1000] Burst de TAG finalizado");
+        // Burst recién completado: imprimir, enviar y/o guardar
+        printAnchorRangesIfNeeded();
+    }
+    s_prevBurstActive = burstActive;
+#endif
 }
 
 void energizeDW1000() {

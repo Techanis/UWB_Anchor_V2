@@ -41,6 +41,8 @@
 #else
 #define DW1000_ISR_ATTR
 #endif
+//Declaracion de semaforo para interrupciones, se define como extern para evitar errores de redefinicion en el proceso de compilacion
+extern SemaphoreHandle_t buttonSemaphore; 
 
 extern SPIClass dw1000SPI;
 
@@ -556,6 +558,9 @@ public:
 	
 	/* internal helper for bit operations on multi-bytes. */
 	static boolean getBit(byte data[], uint16_t n, uint16_t bit);
+	#ifdef setBit
+	#undef setBit
+	#endif
 	static void    setBit(byte data[], uint16_t n, uint16_t bit, boolean val);
 	
 	/* Register is 6 bit, 7 = write, 6 = sub-adressing, 5-0 = register value

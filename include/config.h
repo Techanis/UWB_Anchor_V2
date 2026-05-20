@@ -7,32 +7,14 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include "memory.h"
 #include "time.h"
+#include "esp_task_wdt.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// User config          ------------------------------------------
-#ifndef UWB_ROLE_ANCHOR
-#define UWB_ROLE_ANCHOR 01  // 0 = Tag, 1 = Anchor  (override via -D UWB_ROLE_ANCHOR=...)
-#endif
-#define UWB_TAG_COUNT 64
-#define UWB_MAX_ACTIVE_ANCHORS 8
-#ifndef UWB_ANCHOR_STALE_TIMEOUT_MS
-  #ifdef DW1000_TAG_TX_PERIOD_S
-    // Keep entries alive slightly longer than the TAG burst period so the
-    // anchor does not mark them inactive between normal transmissions.
-    #define UWB_ANCHOR_STALE_TIMEOUT_MS ((DW1000_TAG_TX_PERIOD_S * 1000UL) + 4000UL)
-  #else
-    #define UWB_ANCHOR_STALE_TIMEOUT_MS 12000
-  #endif
-#endif
-#define UWB_ANCHOR_REPORT_INTERVAL_MS 1000
-#ifndef UWB_NO_REMOTE_RESET_TIMEOUT_MS
-#define UWB_NO_REMOTE_RESET_TIMEOUT_MS 10000
-#endif
-#define LED 42
 
 // ---------------------- 
 // Pines de DWM1000
@@ -45,21 +27,45 @@ extern "C" {
 #define DW1000_WAKEUP 5
 // External device enable. Asserted during wake up process and held
 // active until device enters sleep mode. 
-#define DW1000_EXTON  6
-#define DW1000_RST    4
+#define DW1000_EXTON  4
+#define DW1000_RST    6
 #define DW1000_IRQ    9
 #define UWB_EN        8
 
 //-------------- 
 // Pines de energía y batería 
-#define USB_CONNECTED 15    
+// #define USB_CONNECTED 15   
+#define USB_ADC 15    
 #define BAT_HOOK 16
 #define BAT_ADC_EN 17
-#define BAT_ADC   18
+#define BAT_ADC   18   
 
-// WiFi credentials (will be stored in flash memory)
-extern String ssid;               // Your WiFi network SSID
-extern String password;         // Your WiFi network password      
+// Led de estado
+#define LED 42
+
+// ---------------------- 
+// User config          ------------------------------------------
+#ifndef UWB_ROLE_ANCHOR
+#define UWB_ROLE_ANCHOR 01  // 0 = Tag, 1 = Anchor  (override via -D UWB_ROLE_ANCHOR=...)
+#endif
+#define UWB_MAX_ACTIVE_ANCHORS 16
+#ifndef UWB_ANCHOR_STALE_TIMEOUT_MS
+  #ifdef DW1000_TAG_TX_PERIOD_S
+    // Keep entries alive slightly longer than the TAG burst period so the
+    // anchor does not mark them inactive between normal transmissions.
+    #define UWB_ANCHOR_STALE_TIMEOUT_MS ((DW1000_TAG_TX_PERIOD_S * 1000UL) + 4000UL)
+  #else
+    #define UWB_ANCHOR_STALE_TIMEOUT_MS 12000
+  #endif
+#endif
+#define UWB_ANCHOR_REPORT_INTERVAL_MS 1000
+#ifndef UWB_NO_REMOTE_RESET_TIMEOUT_MS
+#define UWB_NO_REMOTE_RESET_TIMEOUT_MS 30000
+#endif
+#ifndef UWB_CPU_WATCHDOG_TIMEOUT_MS
+#define UWB_CPU_WATCHDOG_TIMEOUT_MS 60000
+#endif
+
 
 // Dirección UWB de este nodo (override via -D UWB_ADDRESS=\"...\").
 #ifndef UWB_ADDRESS
@@ -89,15 +95,24 @@ extern String password;         // Your WiFi network password
 #define UWB_ACTIVE_ANTENNA_DELAY UWB_ANTENNA_DELAY_TAG
 #endif
 
-// Data de tiempo para sincronización (NTP)
-# define gmtOffset_sec (5 * -3600) // GMT-5 (Colombia)
-# define daylightOffset_sec 0
+// Master anchor synchronization settings.
+#ifndef DW1000_ANCHOR_MASTER_ENABLED
+#define DW1000_ANCHOR_MASTER_ENABLED 0
+#endif
 
-// Servidores de datos
-#define NTP_SERVER "pool.ntp.org"
-#define DATA_SERVER "http://example.com/data" // Cambia esto por tu servidor real
+//Channel configurations
+#ifndef DW1000_CHANNEL
+#define DW1000_CHANNEL 5
+#endif
 
-#define SERIAL_LOG Serial
+// Definir estados de modulo
+#define MODULE_READY 0
+#define MODULE_ERROR 1 //Response
+#define MODULE_BLUETOOTH 2
+#define MODULE_ESPNOW 3
+#define MODULE_SENDING 4
+
+
 
 #ifdef __cplusplus
 }

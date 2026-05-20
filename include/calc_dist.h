@@ -20,39 +20,111 @@ extern "C" {
 }
 #endif
 
-// /**
-//  * Calcula la mediana de un arreglo de enteros.
-//  * @param datos Arreglo de entrada (se modificará el orden internamente en la copia).
-//  * @param n Tamaño del arreglo.
-//  * @return int El valor central (mediana) redondeado.
-//  */
+// Utilidades ligeras de ordenamiento y estimación robusta para distancias UWB.
+// Se basan en la misma lógica de inserción usada por `calcularMediana()`,
+// pero ahora permiten trabajar con arreglos parciales y con `float`.
 
-template <size_t COLS>
-int calcularMediana(int (&datos)[COLS]) {
-    if (COLS <= 0) return 0;
+template <typename T>
+static inline void ordenarPorInsercion(T* datos, size_t cantidad) {
+    if (cantidad < 2U) {
+        return;
+    }
+// 
+    for (size_t i = 1; i < cantidad; ++i) {
+        T valorActual = datos[i];
+        size_t j = i;
 
-    // 1. Ordenamiento por Inserción (Eficiente para N pequeño en embebidos)
-    for (int i = 1; i < COLS; i++) {
-        int valorActual = datos[i];
-        int j = i - 1;
-
-        // Desplaza los elementos mayores hacia la derecha
-        while (j >= 0 && datos[j] > valorActual) {
-            datos[j + 1] = datos[j];
-            j--;
+        while (j > 0U && datos[j - 1U] > valorActual) {
+            datos[j] = datos[j - 1U];
+            --j;
         }
-        datos[j + 1] = valorActual;
+        datos[j] = valorActual;
+    }
+}
+
+template <typename T>
+static inline T calcularMedianaOrdenada(const T* datosOrdenados, size_t cantidad) {
+    if (cantidad == 0U) {
+        return static_cast<T>(0);
     }
 
-    // 2. Selección de la mediana
-    if (COLS % 2 != 0) {
-        // Si el número de elementos es impar, tomamos el del centro
-        return datos[COLS / 2];
-    } else {
-        // Si es par, promediamos los dos valores centrales y redondeamos
-        // (Valor1 + Valor2 + 1) / 2 es un truco para redondear hacia arriba sin float
-        return (datos[(COLS - 1) / 2] + datos[COLS / 2] + 1) / 2;
+    if ((cantidad % 2U) != 0U) {
+        return datosOrdenados[cantidad / 2U];
     }
+
+    return static_cast<T>((datosOrdenados[(cantidad - 1U) / 2U] + datosOrdenados[cantidad / 2U]) /
+                          static_cast<T>(2));
+}
+
+template <typename T, size_t COLS>
+T calcularMediana(const T (&datos)[COLS], size_t cantidadValidos = COLS) {
+    if (cantidadValidos == 0U) {
+        return static_cast<T>(0);
+    }
+
+    if (cantidadValidos > COLS) {
+        cantidadValidos = COLS;
+    }
+
+    T copia[COLS];
+    for (size_t i = 0; i < cantidadValidos; ++i) {
+        copia[i] = datos[i];
+    }
+
+    ordenarPorInsercion(copia, cantidadValidos);
+    return calcularMedianaOrdenada(copia, cantidadValidos);
+}
+
+template <typename T, size_t COLS>
+T estimarDistanciaRobusta(const T (&datos)[COLS], size_t cantidadValidos = COLS) {
+    if (cantidadValidos == 0U) {
+        return static_cast<T>(0);
+    }
+
+    if (cantidadValidos > COLS) {
+        cantidadValidos = COLS;
+    }
+
+    T copia[COLS];
+    size_t cantidadUtil = 0U;
+
+    for (size_t i = 0; i < cantidadValidos; ++i) {
+        if (datos[i] > static_cast<T>(0)) {
+            copia[cantidadUtil++] = datos[i];
+        }
+    }
+
+    if (cantidadUtil == 0U) {
+        return static_cast<T>(0);
+    }
+
+    ordenarPorInsercion(copia, cantidadUtil);
+    const T mediana = calcularMedianaOrdenada(copia, cantidadUtil);
+
+    if (cantidadUtil < 3U) {
+        return mediana;
+    }
+
+    size_t descarteExtremos = (cantidadUtil >= 5U) ? 1U : 0U;
+    if ((descarteExtremos * 2U) >= cantidadUtil) {
+        descarteExtremos = 0U;
+    }
+
+    float sumaCentral = 0.0f;
+    size_t cantidadCentral = 0U;
+    for (size_t i = descarteExtremos; i < (cantidadUtil - descarteExtremos); ++i) {
+        sumaCentral += static_cast<float>(copia[i]);
+        ++cantidadCentral;
+    }
+
+    const float promedioRecortado =
+        (cantidadCentral > 0U) ? (sumaCentral / static_cast<float>(cantidadCentral))
+                               : static_cast<float>(mediana);
+
+    // 70% mediana + 30% promedio recortado:
+    // mantiene robustez ante outliers, pero suaviza variaciones entre rondas.
+    return static_cast<T>(0.7f * static_cast<float>(mediana) +
+                          0.3f * promedioRecortado);
 }
 
 #endif // CALC_DIST_H

@@ -19,7 +19,11 @@
  */
 
 #include "DW1000.h"
-
+#if defined(ARDUINO_ARCH_ESP32)
+#include "driver/gpio.h"
+#endif
+//Semaforo para evitar esperar 1ms en el loop de DW1000
+SemaphoreHandle_t buttonSemaphore = NULL;
 DW1000Class DW1000;
 
 /* ###########################################################################
@@ -102,6 +106,7 @@ const byte DW1000Class::BIAS_500_64[] = {110, 105, 100, 93, 82, 69, 51, 27, 0, 2
 const byte DW1000Class::BIAS_900_16[] = {137, 122, 105, 88, 69, 47, 25, 0, 21, 48, 79, 105, 127, 147, 160, 169, 178, 197};
 const byte DW1000Class::BIAS_900_64[] = {147, 133, 117, 99, 75, 50, 29, 0, 24, 45, 63, 76, 87, 98, 116, 122, 132, 142};
 */
+
 // SPI settings
 SPIClass dw1000SPI(FSPI);
 #ifdef ESP8266
@@ -200,7 +205,12 @@ void DW1000Class::begin(uint8_t irq, uint8_t rst, uint8_t sck, uint8_t miso, uin
 	_mosi		= mosi;
 	_deviceMode = IDLE_MODE;
 	// Detach before re-attaching to prevent duplicate handlers on ESP32 after reset.
-	detachInterrupt(digitalPinToInterrupt(irq));
+	// On ESP-IDF 5.x, detachInterrupt calls gpio_isr_handler_remove which requires
+	// the ISR service to be installed first. Install it here (idempotent).
+#if defined(ARDUINO_ARCH_ESP32)
+	gpio_install_isr_service(0);
+#endif
+	// detachInterrupt(digitalPinToInterrupt(irq));
 	attachInterrupt(digitalPinToInterrupt(irq), DW1000Class::handleInterrupt, RISING);
 }
 
@@ -536,6 +546,7 @@ void DW1000Class::tune() {
 		// TODO proper error/warning handling
 	}
 	// LDE_CFG1
+	// writeValueToBytes(ldecfg1, 0xD, LEN_LDE_CFG1);
 	writeValueToBytes(ldecfg1, 0xD, LEN_LDE_CFG1);
 	// LDE_CFG2
 	if(_pulseFrequency == TX_PULSE_FREQ_16MHZ) {
@@ -742,43 +753,67 @@ void DW1000Class::tune() {
  * #### Interrupt handling ###################################################
  * ######################################################################### */
 
-void DW1000Class::handleInterrupt() {
-	_interruptPending = true;
-	Serial.println("Interrupt received");
+void IRAM_ATTR DW1000Class::handleInterrupt() {
+	// NOTE: Do NOT call Serial or any blocking function from an ISR.
+	// Serial uses an internal UART mutex; calling it here will deadlock
+	// if the interrupted task already holds that mutex.
+	BaseType_t higherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(buttonSemaphore, &higherPriorityTaskWoken);
+    if (higherPriorityTaskWoken) {
+      portYIELD_FROM_ISR();
+    }
 }
 
-void DW1000Class::processInterrupt() {
-	if(!_interruptPending) {
-		return;
-	}
-	noInterrupts();
-	_interruptPending = false;
-	interrupts();
+// Función para imprimir 8 bits con ceros a la izquierda
+void printBinario8(byte b) {
+  for (int i = 7; i >= 0; i--) {
+    Serial.print(bitRead(b, i));
+  }
+}
 
+void  DW1000Class::processInterrupt() {
+	// if(!_interruptPending) {
+	// 	return;
+	// }
+	// noInterrupts();
+	// _interruptPending = false;
+	// interrupts();
+	// Serial.println("Interrupt received, processing...");
+	// delayMicroseconds(10); // TODO is this necessary? if so, find optimal value (dw1000 data sheet v2.08 §5.6.1 page 20: "The DW1000 requires a delay of 10 μs after the interrupt is triggered before the SPI can be used to read the status registers.")
 	// read current status and handle via callbacks
 	readSystemEventStatusRegister();
+	// for (int i = 0; i < sizeof(_sysstatus); i++) {
+	// 	printBinario8(_sysstatus[i]);
+	// 	Serial.print(' ');
+	// }
+	// Serial.println();
+	// Serial.println(isReceiveDone());
 	if(isClockProblem() /* TODO and others */ && _handleError != 0) {
 		(*_handleError)();
-		Serial.println("Error callback called");
+		// Serial.println("Error callback called");
 	}
+	
 	if(isTransmitDone() && _handleSent != 0) {
 		(*_handleSent)();
 		clearTransmitStatus();
 		// Re-enable RX after delayed TX completes when permanent-receive
 		// is on and we are in IDLE (i.e. startTransmit skipped startReceive).
+		
 		if(_permanentReceive && _deviceMode != RX_MODE) {
 			newReceive();
 			startReceive();
 		}
 		// Serial.println("Transmit done callback called");
 	}
+
 	if(isReceiveTimestampAvailable() && _handleReceiveTimestampAvailable != 0) {
 		(*_handleReceiveTimestampAvailable)();
 		clearReceiveTimestampAvailableStatus();
+		// Serial.println("Transmit done callback called");
 	}
+
 	if(isReceiveFailed()) {
-		Serial.println("Receive failed");
-		Serial.println(_permanentReceive);
+		// Serial.println("Receive failed");
 		if(_handleReceiveFailed != 0) {
 			(*_handleReceiveFailed)();
 		}
@@ -1101,6 +1136,11 @@ void DW1000Class::idle() {
 void DW1000Class::newReceive() {
 	idle();
 	memset(_sysctrl, 0, LEN_SYS_CTRL);
+	// for (int i = 0; i < sizeof(_sysstatus); i++) {
+	// printBinario8(_sysstatus[i]);
+	// Serial.print(' '); // Nueva línea para cada byte
+  	// }
+	// Serial.println();
 	clearReceiveStatus();
 	_deviceMode = RX_MODE;
 }
@@ -1531,14 +1571,21 @@ boolean DW1000Class::isReceiveTimestampAvailable() {
 }
 
 boolean DW1000Class::isReceiveDone() {
-	if(_frameCheck) {
-		return getBit(_sysstatus, LEN_SYS_STATUS, RXFCG_BIT);
-	}
+	// _frameCheck = false;
+	// Serial.println("frame check: " + String(_frameCheck));
+	// if(_frameCheck) {
+	// 	return getBit(_sysstatus, LEN_SYS_STATUS, RXFCG_BIT);
+	// }
 	return getBit(_sysstatus, LEN_SYS_STATUS, RXDFR_BIT);
 }
 
 boolean DW1000Class::isReceiveFailed() {
 	boolean ldeErr, rxCRCErr, rxHeaderErr, rxDecodeErr;
+	// for (int i = 0; i < sizeof(_sysstatus); i++) {
+	// 	printBinario8(_sysstatus[i]);
+	// 	Serial.print(' '); // Nueva línea para cada byte
+  	// }
+	// Serial.println();
 	ldeErr      = getBit(_sysstatus, LEN_SYS_STATUS, LDEERR_BIT);
 	rxCRCErr    = getBit(_sysstatus, LEN_SYS_STATUS, RXFCE_BIT);
 	rxHeaderErr = getBit(_sysstatus, LEN_SYS_STATUS, RXPHE_BIT);
@@ -1576,6 +1623,7 @@ void DW1000Class::clearReceiveTimestampAvailableStatus() {
 }
 
 void DW1000Class::clearReceiveStatus() {
+	
 	// clear latched RX bits (i.e. write 1 to clear)
 	setBit(_sysstatus, LEN_SYS_STATUS, RXDFR_BIT, true);
 	setBit(_sysstatus, LEN_SYS_STATUS, LDEDONE_BIT, true);
@@ -1759,7 +1807,9 @@ void DW1000Class::readBytes(byte cmd, uint16_t offset, byte data[], uint16_t n) 
 			headerLen += 2;
 		}
 	}
+
 	dw1000SPI.beginTransaction(*_currentSPI);
+
 	digitalWrite(_ss, LOW);
 	for(i = 0; i < headerLen; i++) {
 		dw1000SPI.transfer(header[i]); // send header
